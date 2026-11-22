@@ -41,6 +41,7 @@ Task queues are used as a mechanism to distribute work across multiple machines.
 - Integration with [Prometheus](https://prometheus.io/) to collect and visualize queue metrics
 - [Web UI](#web-ui) to inspect and remote-control queues and tasks
 - [CLI](#command-line-tool) to inspect and remote-control queues and tasks
+- [PostgreSQL backend](#postgresql-backend-optional) as an alternative to Redis
 
 ## Stability and Compatibility
 
@@ -266,6 +267,112 @@ func main() {
 For a more detailed walk-through of the library, see our [Getting Started](https://github.com/hibiken/asynq/wiki/Getting-Started) guide.
 
 To learn more about `asynq` features and APIs, see the package [godoc](https://godoc.org/github.com/hibiken/asynq).
+
+## PostgreSQL Backend (Optional)
+
+Asynq supports PostgreSQL as an alternative broker backend. This is useful when you already run PostgreSQL and don't want to add Redis to your infrastructure.
+
+### Setup
+
+Install a PostgreSQL driver alongside asynq:
+
+```sh
+go get -u github.com/hibiken/asynq
+go get -u github.com/lib/pq          # or github.com/jackc/pgx/v5/stdlib
+```
+
+### Client
+
+```go
+package main
+
+import (
+    "database/sql"
+    "log"
+
+    _ "github.com/lib/pq" // PostgreSQL driver
+    "github.com/hibiken/asynq"
+)
+
+func main() {
+    db, err := sql.Open("postgres", "postgres://user:pass@localhost/asynq?sslmode=disable")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    client, err := asynq.NewClientFromDB(db)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    task := asynq.NewTask("email:deliver", []byte(`{"user_id": 42}`))
+    info, err := client.Enqueue(task)
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("enqueued task: id=%s queue=%s", info.ID, info.Queue)
+}
+```
+
+### Worker Server
+
+```go
+package main
+
+import (
+    "database/sql"
+    "log"
+
+    _ "github.com/lib/pq"
+    "github.com/hibiken/asynq"
+)
+
+func main() {
+    db, err := sql.Open("postgres", "postgres://user:pass@localhost/asynq?sslmode=disable")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    srv, err := asynq.NewServerFromDB(db, asynq.Config{
+        Concurrency: 10,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    mux := asynq.NewServeMux()
+    mux.HandleFunc("email:deliver", handleEmailTask)
+
+    if err := srv.Run(mux); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+### How It Works
+
+The PostgreSQL broker creates the required tables automatically on first connection. It uses:
+
+- **`FOR UPDATE SKIP LOCKED`** for safe concurrent task dequeue across multiple workers
+- **Polling-based cancelation** (500ms interval) since `database/sql` doesn't support PostgreSQL's `LISTEN/NOTIFY`
+- **SQL transactions** for atomic state transitions (enqueue, dequeue, retry, archive, complete)
+- **Lease-based processing** with 30-second leases, same as the Redis backend
+
+All asynq features work with the PostgreSQL backend: retries, scheduling, unique tasks, task aggregation/grouping, server heartbeats, and task cancelation.
+
+### Redis vs PostgreSQL
+
+| | Redis | PostgreSQL |
+|---|---|---|
+| Latency | Sub-millisecond | Low milliseconds |
+| Cancelation | Instant (PubSub) | ~500ms (polling) |
+| Extra infra | Requires Redis | Uses existing PG |
+| Throughput | Higher | Good for most workloads |
+
+Choose PostgreSQL when you want to avoid running Redis. Choose Redis when you need maximum throughput or sub-millisecond latency.
 
 ## Web UI
 
